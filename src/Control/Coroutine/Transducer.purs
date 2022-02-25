@@ -1,5 +1,6 @@
 module Control.Coroutine.Transducer
-  ( Transducer
+  ( Transduce
+  , Transducer
   , fuse, (=>=)
   , awaitT
   , awaitForever
@@ -20,7 +21,7 @@ module Control.Coroutine.Transducer
 import Prelude
 
 import Control.Coroutine (Await(..), Co, CoTransform(..), CoTransformer, Consumer, Emit(..), Process, Producer, Transform(..), Transformer, loop)
-import Control.Monad.Free.Trans (freeT, interpret, liftFreeT, resume, substFreeT)
+import Control.Monad.Free.Trans (FreeT, freeT, interpret, liftFreeT, resume, substFreeT)
 import Control.Monad.Rec.Class (class MonadRec)
 import Control.Monad.Trans.Class (lift)
 import Control.Parallel (class Parallel, parallel, sequential)
@@ -31,7 +32,8 @@ import Data.Traversable (traverse_)
 import Data.Tuple (Tuple(..))
 
 
-type Transducer i o = Co (Coproduct ((->) (Maybe i)) (Tuple o))
+type Transduce i o = Coproduct ((->) (Maybe i)) (Tuple o)
+type Transducer i o = Co (Transduce i o)
 
 -- | The `fuse` operator runs an upstream and downstream `Transducer` in parallel. In the event that
 -- | the upstream pauses with an emit statement and the downstream with an await statement,
@@ -63,7 +65,20 @@ infixr 2 fuse as =>=
 
 -- | Await an upstream value.
 awaitT :: forall i o m. Monad m => Transducer i o m (Maybe i)
-awaitT = freeT $ \_ -> pure <<< Right $ (left pure)
+awaitT = freeT f
+  where
+        f :: Unit -> m (Either (Maybe i) (Transduce i o (Transducer i o m (Maybe i))))
+        f = \_ -> pure <<< r $ m
+
+        -- | r :: Coproduct (Function (Maybe i)) (Tuple o) (FreeT (Coproduct (Function (Maybe i)) (Tuple o)) m (Maybe i))
+        -- |   -> Either (Maybe i) (Coproduct (Function (Maybe i)) (Tuple o) (FreeT (Coproduct (Function (Maybe i)) (Tuple o)) m (Maybe i)))
+        r :: Transduce i o (Transducer i o m (Maybe i))
+          -> Either (Maybe i) (Transduce i o (Transducer i o m (Maybe i)))
+        r = Right
+
+        -- | m :: Coproduct (Function (Maybe i)) (Tuple o) (FreeT (Coproduct (Function (Maybe i)) (Tuple o)) m (Maybe i))
+        m :: Transduce i o (Transducer i o m (Maybe i))
+        m = left pure
 
 -- | Continue waiting for upstream values, while never returning.
 awaitForever :: forall i o m r. Monad m => (i -> Transducer i o m r) -> Transducer i o m Unit
@@ -97,7 +112,12 @@ liftStateless f = do
   maybe (pure unit) (\i -> traverse_ yieldT (f i) >>= \_ -> liftStateless f) mi
 
 -- | Transform values according to an accumulated state `s`.
-liftStateful :: forall i o m s. Monad m => (s -> i -> Tuple s (Array o)) -> (s -> Array o) -> s -> Transducer i o m Unit
+liftStateful
+  :: forall i o m s. Monad m
+  => (s -> i -> Tuple s (Array o))
+  -> (s -> Array o) -- eof - what to send IIF producer doesnt send anything, BUT consumer still awaits value
+  -> s
+  -> Transducer i o m Unit
 liftStateful f eof s = do
   mi <- awaitT
   maybe (traverse_ yieldT (eof s)) (\i -> let Tuple s' bs = f s i
